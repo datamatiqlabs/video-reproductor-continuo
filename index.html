@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reproductor Continuo desde Google Sheets</title>
+  
+  <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css" />
+  
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: #0f0f11;
+      color: #e1e1e6;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    h1 { font-size: 1.6rem; color: #fff; margin-bottom: 8px; }
+    p { color: #a0a0b0; font-size: 0.95rem; line-height: 1.4; }
+    
+    .card {
+      background: #18181c;
+      border: 1px solid #282830;
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 20px;
+    }
+    
+    .input-group {
+      display: flex;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    
+    input[type="text"] {
+      flex: 1;
+      background: #0f0f11;
+      border: 1px solid #383845;
+      color: #fff;
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 0.9rem;
+    }
+    
+    button {
+      background: #6200ee;
+      color: white;
+      border: none;
+      padding: 10px 18px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+      transition: background 0.2s;
+    }
+    
+    button:hover { background: #7722ff; }
+    
+    .player-wrapper {
+      background: #000;
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.7);
+      position: relative;
+      min-height: 300px;
+    }
+    
+    iframe.generic-frame {
+      width: 100%;
+      height: 480px;
+      border: none;
+    }
+    
+    .controls {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 15px;
+    }
+    
+    .badge {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: bold;
+      text-transform: uppercase;
+      background: #383845;
+      color: #fff;
+    }
+
+    .playlist-preview {
+      max-height: 200px;
+      overflow-y: auto;
+      margin-top: 10px;
+      border-top: 1px solid #282830;
+      padding-top: 10px;
+    }
+    
+    .playlist-item {
+      padding: 8px;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      display: flex;
+      justify-content: space-between;
+      color: #aaa;
+    }
+    .playlist-item.active {
+      background: #252530;
+      color: #fff;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Reproductor Continuo Web App</h1>
+  <p>Carga los enlaces desde tu planilla de Google Sheets o usa el agregador manual.</p>
+
+  <div class="card">
+    <label for="sheet-url"><strong>URL o ID de Google Sheets (Publicado como CSV):</strong></label>
+    <div class="input-group">
+      <input type="text" id="sheet-url" placeholder="https://docs.google.com/spreadsheets/d/e/.../pub?output=csv">
+      <button onclick="loadFromGoogleSheets()">Cargar Planilla</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <span class="badge" id="platform-badge">Detectando...</span>
+      <span id="track-number" style="font-size: 0.9rem; color: #888;">Video 0 de 0</span>
+    </div>
+    <h3 id="current-title" style="margin: 10px 0;">Esperando lista de videos...</h3>
+
+    <div class="player-wrapper" id="player-container">
+      <div id="plyr-target"></div>
+    </div>
+
+    <div class="controls">
+      <button onclick="prevVideo()">⏮ Anterior</button>
+      <button onclick="nextVideo()">Siguiente ⏭</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <strong>Lista cargada:</strong>
+    <div class="playlist-preview" id="playlist-preview">
+      <em>No hay videos cargados aún.</em>
+    </div>
+  </div>
+
+  <script src="https://cdn.plyr.io/3.7.8/plyr.polyfilled.js"></script>
+
+  <script>
+    let playlist = [];
+    let currentIndex = 0;
+    let plyrInstance = null;
+
+    // Detectar el tipo de fuente o plataforma a partir de la URL
+    function detectSource(url) {
+      url = url.trim();
+      
+      // Direct MP4 / WebM
+      if (url.match(/\.(mp4|webm|ogg)($|\?)/i)) {
+        return { type: 'direct', provider: 'html5', url: url };
+      }
+      // YouTube
+      let ytMatch = url.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})/);
+      if (ytMatch) {
+        return { type: 'plyr', provider: 'youtube', embedId: ytMatch[1] };
+      }
+      // Vimeo
+      let vimeoMatch = url.match(/vimeo\.com\/(?:channels\/(?:\w+\/)?|groups\/([^\/]*)\/videos\/|album\/(\d+)\/video\/|)(\d+)/);
+      if (vimeoMatch) {
+        return { type: 'plyr', provider: 'vimeo', embedId: vimeoMatch[3] };
+      }
+      // Fallback: Embed general en iframe (Portal de noticias, Instagram, X, Facebook, Adultos, etc.)
+      return { type: 'generic_iframe', url: url };
+    }
+
+    // Cargar planilla desde Google Sheets (en formato CSV)
+    async function loadFromGoogleSheets() {
+      const inputVal = document.getElementById('sheet-url').value.trim();
+      if (!inputVal) {
+        alert("Por favor ingresa un enlace o ID válido.");
+        return;
+      }
+
+      let fetchUrl = inputVal;
+      if (!inputVal.includes('output=csv')) {
+        let matches = inputVal.match(/\/d\/([a-zA-Z0-9-_]+)/);
+        if (matches && matches[1]) {
+          fetchUrl = `https://docs.google.com/spreadsheets/d/${matches[1]}/export?format=csv`;
+        }
+      }
+
+      try {
+        const response = await fetch(fetchUrl);
+        if (!response.ok) throw new Error("No se pudo descargar la lista. Revisa los permisos de publicación.");
+        const text = await response.text();
+        
+        // Parsear lineas CSV
+        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+        playlist = lines.map((line, idx) => {
+          let cols = line.split(',');
+          let url = cols[0].replace(/^["']|["']$/g, '').trim();
+          let title = cols[1] ? cols[1].replace(/^["']|["']$/g, '').trim() : `Video ${idx + 1}`;
+          return { url, title, info: detectSource(url) };
+        }).filter(item => item.url.startsWith('http'));
+
+        if (playlist.length === 0) {
+          alert("No se encontraron enlaces válidos (que empiecen con http) en la primera columna.");
+          return;
+        }
+
+        currentIndex = 0;
+        updatePlaylistUI();
+        playCurrentTrack();
+
+      } catch (err) {
+        alert("Error al cargar Google Sheets: " + err.message);
+      }
+    }
+
+    function updatePlaylistUI() {
+      const container = document.getElementById('playlist-preview');
+      container.innerHTML = playlist.map((item, idx) => `
+        <div class="playlist-item ${idx === currentIndex ? 'active' : ''}">
+          <span>${idx + 1}. ${item.title}</span>
+          <small>${item.info.provider || item.info.type}</small>
+        </div>
+      `).join('');
+
+      document.getElementById('track-number').innerText = `Video ${currentIndex + 1} de ${playlist.length}`;
+    }
+
+    function playCurrentTrack() {
+      if (playlist.length === 0) return;
+
+      const track = playlist[currentIndex];
+      const container = document.getElementById('player-container');
+      document.getElementById('current-title').innerText = track.title;
+      document.getElementById('platform-badge').innerText = track.info.provider || track.info.type;
+
+      // Destruir reproductor anterior de Plyr si existe
+      if (plyrInstance) {
+        plyrInstance.destroy();
+        plyrInstance = null;
+      }
+
+      container.innerHTML = '';
+
+      if (track.info.type === 'plyr') {
+        const div = document.createElement('div');
+        div.id = 'plyr-target';
+        div.setAttribute('data-plyr-provider', track.info.provider);
+        div.setAttribute('data-plyr-embed-id', track.info.embedId);
+        container.appendChild(div);
+
+        plyrInstance = new Plyr('#plyr-target', { autoplay: true });
+        plyrInstance.on('ended', () => nextVideo());
+        plyrInstance.once('ready', () => plyrInstance.play());
+
+      } else if (track.info.type === 'direct') {
+        const video = document.createElement('video');
+        video.id = 'plyr-target';
+        video.controls = true;
+        video.autoplay = true;
+        video.src = track.info.url;
+        container.appendChild(video);
+
+        plyrInstance = new Plyr(video, { autoplay: true });
+        plyrInstance.on('ended', () => nextVideo());
+        plyrInstance.once('ready', () => plyrInstance.play());
+
+      } else {
+        // Embed genérico Iframe
+        const iframe = document.createElement('iframe');
+        iframe.className = 'generic-frame';
+        iframe.src = track.info.url;
+        iframe.allow = "autoplay; encrypted-media";
+        container.appendChild(iframe);
+        
+        // Nota: Si es un iframe genérico de otra web, no se puede escuchar 'ended' directamente por CORS.
+      }
+
+      updatePlaylistUI();
+    }
+
+    function nextVideo() {
+      if (playlist.length === 0) return;
+      currentIndex = (currentIndex + 1) % playlist.length;
+      playCurrentTrack();
+    }
+
+    function prevVideo() {
+      if (playlist.length === 0) return;
+      currentIndex = (currentIndex - 1 + playlist.length) % playlist.length;
+      playCurrentTrack();
+    }
+  </script>
+</body>
+</html>
