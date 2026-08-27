@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Reproductor Continuo desde Google Sheets</title>
+  <title>Reproductor Continuo Web App v2 (Auto-Extractor MP4)</title>
   
   <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css" />
   
@@ -64,6 +64,9 @@
       box-shadow: 0 10px 30px rgba(0,0,0,0.7);
       position: relative;
       min-height: 300px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
     
     iframe.generic-frame {
@@ -111,12 +114,18 @@
       color: #fff;
       font-weight: bold;
     }
+    
+    .loading-spinner {
+      color: #a0a0b0;
+      font-size: 1rem;
+      text-align: center;
+    }
   </style>
 </head>
 <body>
 
-  <h1>Reproductor Continuo Web App</h1>
-  <p>Carga los enlaces desde tu planilla de Google Sheets o usa el agregador manual.</p>
+  <h1>Reproductor Continuo Web App (Auto-Extractor)</h1>
+  <p>Carga los enlaces desde tu planilla de Google Sheets. El sistema intentará extraer automáticamente el MP4 de sitios web de terceros usando un Proxy CORS.</p>
 
   <div class="card">
     <label for="sheet-url"><strong>URL o ID de Google Sheets (Publicado como CSV):</strong></label>
@@ -157,6 +166,142 @@
     let currentIndex = 0;
     let plyrInstance = null;
 
+    // Reemplazo mejorado de extractMp4WithProxy: intenta múltiples heurísticas (meta tags, JSON-LD, <video>/<source>, jwplayer, patrones TikTok/Instagram/Twitter/Reddit/Facebook, búsqueda .mp4)
+    async function extractMp4WithProxy(pageUrl) {
+      try {
+        // Nota: allorigins es un proxy público de ejemplo. Para producción usa tu propio proxy/backend.
+        const proxyUrl = 'https://api.allorigins.win/get?url=' + encodeURIComponent(pageUrl);
+        const response = await fetch(proxyUrl);
+        if (!response.ok) return null;
+        const data = await response.json();
+        let html = data.contents || '';
+
+        // Helper: normalizar URL relativa -> absoluta
+        const toAbsolute = (candidate) => {
+          try {
+            return new URL(candidate, pageUrl).href;
+          } catch (e) {
+            return null;
+          }
+        };
+
+        // 1) Buscar meta tags (og:video, og:video:url, og:video:secure_url, twitter:player)
+        const metaOgVideo = html.match(/<meta[^>]+(?:property|name)=["'](?:og:video|og:video:url|og:video:secure_url|twitter:player|video_src)["'][^>]*content=["']([^"']+)["']/i);
+        if (metaOgVideo && metaOgVideo[1]) {
+          const abs = toAbsolute(metaOgVideo[1]);
+          if (abs && \.mp4($|\?)/i.test(abs)) return abs;
+          if (abs && !abs.includes('twitter.com') && /\.m3u8/i.test(abs) === false) return abs;
+        }
+
+        // 2) Buscar JSON-LD (VideoObject)
+        const ldMatches = [...html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/ig)];
+        for (const m of ldMatches) {
+          try {
+            const parsed = JSON.parse(m[1]);
+            const extractFromLd = (obj) => {
+              if (!obj) return null;
+              if (obj.contentUrl && \.mp4($|\?)/i.test(obj.contentUrl)) return toAbsolute(obj.contentUrl);
+              if (obj.url && \.mp4($|\?)/i.test(obj.url)) return toAbsolute(obj.url);
+              return null;
+            };
+            if (Array.isArray(parsed)) {
+              for (const p of parsed) {
+                const r = extractFromLd(p);
+                if (r) return r;
+              }
+            } else {
+              const r = extractFromLd(parsed);
+              if (r) return r;
+            }
+          } catch (e) {
+            // ignora json parse errors
+          }
+        }
+
+        // 3) Buscar etiquetas <video> y <source>
+        const videoTagMatch = html.match(/<video[\s\S]*?src=["']([^"']+)["']/i);
+        if (videoTagMatch && videoTagMatch[1]) {
+          const abs = toAbsolute(videoTagMatch[1]);
+          if (abs && \.mp4($|\?)/i.test(abs)) return abs;
+        }
+        const sourceTagMatch = html.match(/<source[^>]*src=["']([^"']+)["'][^>]*>/i);
+        if (sourceTagMatch && sourceTagMatch[1]) {
+          const abs = toAbsolute(sourceTagMatch[1]);
+          if (abs && \.mp4($|\?)/i.test(abs)) return abs;
+        }
+
+        // 4) jwplayer setup JSON
+        const jwMatch = html.match(/jwplayer\([^\)]*\)\.setup\(\s*({[\s\S]*?})\s*\)/i);
+        if (jwMatch && jwMatch[1]) {
+          try {
+            const cfg = JSON.parse(jwMatch[1].replace(/(['\"])?([a-zA-Z0-9_]+)\1\s*:/g, '"$2":'));
+            if (cfg && cfg.file && \.mp4($|\?)/i.test(cfg.file)) return toAbsolute(cfg.file);
+            if (cfg && cfg.sources && Array.isArray(cfg.sources)) {
+              for (const s of cfg.sources) {
+                if (s.file && \.mp4($|\?)/i.test(s.file)) return toAbsolute(s.file);
+              }
+            }
+          } catch (e) {
+            // ignore
+          }
+        }
+
+        // 5) html5player.setVideoUrlHigh / setVideoUrlLow / video_url
+        const matchScript = html.match(/setVideoUrlHigh\(['\"]([^'\"]+)['\"]\)/i) ||
+                            html.match(/setVideoUrlLow\(['\"]([^'\"]+)['\"]\)/i) ||
+                            html.match(/video_url\s*:\s*['\"]([^'\"]+)['\"]/i) ||
+                            html.match(/"videoUrl"\s*:\s*"([^"]+)"/i);
+        if (matchScript && matchScript[1]) {
+          const abs = toAbsolute(matchScript[1]);
+          if (abs) return abs;
+        }
+
+        // 6) Patrones específicos de plataformas
+        // TikTok
+        const tiktokMatch = html.match(/"playAddr"\s*:\s*"([^\"]+\.mp4[^\"]*)"/i) || html.match(/"downloadAddr"\s*:\s*"([^\"]+\.mp4[^\"]*)"/i);
+        if (tiktokMatch && tiktokMatch[1]) {
+          const unesc = tiktokMatch[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
+          const abs = toAbsolute(unesc);
+          if (abs) return abs;
+        }
+
+        // Instagram (og:video / video_url already covered but keep)
+        const instaOg = html.match(/<meta[^>]+property=["']og:video["'][^>]*content=["']([^"']+)["']/i) || html.match(/"video_url"\s*:\s*"([^"]+)"/i);
+        if (instaOg && instaOg[1]) return toAbsolute(instaOg[1]);
+
+        // Twitter/X: video.twimg.com or pbs.twimg.com
+        const twMatch = html.match(/https?:\/\/video\.twimg\.com\/[^"'\s>]+\.mp4/ig) || html.match(/https?:\/\/pbs\.twimg\.com\/[^"'\s>]+\.mp4/ig);
+        if (twMatch && twMatch.length) return toAbsolute(twMatch[0]);
+
+        // Reddit: fallback_url
+        const redditMatch = html.match(/"fallback_url"\s*:\s*"([^"']+\.mp4[^"']*)"/i);
+        if (redditMatch && redditMatch[1]) return toAbsolute(redditMatch[1].replace(/\\u0026/g, '&').replace(/\\/g, ''));
+
+        // Facebook: sd_src / hd_src
+        const fbMatch = html.match(/"sd_src_no_ratelimit"\s*:\s*"([^"]+)"/i) || html.match(/"hd_src"\s*:\s*"([^"]+)"/i) || html.match(/"sd_src"\s*:\s*"([^"]+)"/i);
+        if (fbMatch && fbMatch[1]) return toAbsolute(fbMatch[1].replace(/\\u0026/g, '&').replace(/\\/g, ''));
+
+        // 7) Buscar file/src/url en JSON dentro de scripts
+        const fileMatches = [...html.matchAll(/["'](?:file|src|url)["']\s*:\s*["']([^"']+\.mp4[^"']*)["']/ig)];
+        if (fileMatches.length) {
+          for (const fm of fileMatches) {
+            const candidate = fm[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
+            const abs = toAbsolute(candidate);
+            if (abs) return abs;
+          }
+        }
+
+        // 8) Busqueda general de .mp4 en el HTML
+        const mp4Matches = html.match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*/gi);
+        if (mp4Matches && mp4Matches.length > 0) return mp4Matches[0];
+
+        return null;
+      } catch (e) {
+        console.warn("Fallo en extracción por proxy:", e);
+        return null;
+      }
+    }
+
     // Detectar el tipo de fuente o plataforma a partir de la URL
     function detectSource(url) {
       url = url.trim();
@@ -171,12 +316,12 @@
         return { type: 'plyr', provider: 'youtube', embedId: ytMatch[1] };
       }
       // Vimeo
-      let vimeoMatch = url.match(/vimeo\.com\/(?:channels\/(?:\w+\/)?|groups\/([^\/]*)\/videos\/|album\/(\d+)\/video\/|)(\d+)/);
+      let vimeoMatch = url.match(/vimeo\.com\/(?:channels\/(?:\w+\/)?|groups\/(?:[^\/]*)\/videos\/|album\/(\d+)\/video\/|)(\d+)/);
       if (vimeoMatch) {
-        return { type: 'plyr', provider: 'vimeo', embedId: vimeoMatch[3] };
+        return { type: 'plyr', provider: 'vimeo', embedId: vimeoMatch[2] };
       }
-      // Fallback: Embed general en iframe (Portal de noticias, Instagram, X, Facebook, Adultos, etc.)
-      return { type: 'generic_iframe', url: url };
+      // Scraping con Proxy necesario
+      return { type: 'scraping_needed', url: url };
     }
 
     // Cargar planilla desde Google Sheets (en formato CSV)
@@ -197,20 +342,19 @@
 
       try {
         const response = await fetch(fetchUrl);
-        if (!response.ok) throw new Error("No se pudo descargar la lista. Revisa los permisos de publicación.");
+        if (!response.ok) throw new Error("No se pudo descargar la lista.");
         const text = await response.text();
         
-        // Parsear lineas CSV
         const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
         playlist = lines.map((line, idx) => {
           let cols = line.split(',');
-          let url = cols[0].replace(/^["']|["']$/g, '').trim();
-          let title = cols[1] ? cols[1].replace(/^["']|["']$/g, '').trim() : `Video ${idx + 1}`;
+          let url = cols[0].replace(/^['\"]|['\"]$/g, '').trim();
+          let title = cols[1] ? cols[1].replace(/^['\"]|['\"]$/g, '').trim() : `Video ${idx + 1}`;
           return { url, title, info: detectSource(url) };
         }).filter(item => item.url.startsWith('http'));
 
         if (playlist.length === 0) {
-          alert("No se encontraron enlaces válidos (que empiecen con http) en la primera columna.");
+          alert("No se encontraron enlaces válidos en la primera columna.");
           return;
         }
 
@@ -235,7 +379,7 @@
       document.getElementById('track-number').innerText = `Video ${currentIndex + 1} de ${playlist.length}`;
     }
 
-    function playCurrentTrack() {
+    async function playCurrentTrack() {
       if (playlist.length === 0) return;
 
       const track = playlist[currentIndex];
@@ -243,7 +387,6 @@
       document.getElementById('current-title').innerText = track.title;
       document.getElementById('platform-badge').innerText = track.info.provider || track.info.type;
 
-      // Destruir reproductor anterior de Plyr si existe
       if (plyrInstance) {
         plyrInstance.destroy();
         plyrInstance = null;
@@ -263,29 +406,43 @@
         plyrInstance.once('ready', () => plyrInstance.play());
 
       } else if (track.info.type === 'direct') {
-        const video = document.createElement('video');
-        video.id = 'plyr-target';
-        video.controls = true;
-        video.autoplay = true;
-        video.src = track.info.url;
-        container.appendChild(video);
+        renderDirectVideo(track.info.url, container);
 
-        plyrInstance = new Plyr(video, { autoplay: true });
-        plyrInstance.on('ended', () => nextVideo());
-        plyrInstance.once('ready', () => plyrInstance.play());
-
-      } else {
-        // Embed genérico Iframe
-        const iframe = document.createElement('iframe');
-        iframe.className = 'generic-frame';
-        iframe.src = track.info.url;
-        iframe.allow = "autoplay; encrypted-media";
-        container.appendChild(iframe);
+      } else if (track.info.type === 'scraping_needed') {
+        container.innerHTML = '<div class="loading-spinner">🔍 Extrayendo video directo mediante Proxy...</div>';
         
-        // Nota: Si es un iframe genérico de otra web, no se puede escuchar 'ended' directamente por CORS.
+        const extractedMp4 = await extractMp4WithProxy(track.url);
+        container.innerHTML = '';
+
+        if (extractedMp4) {
+          console.log("¡MP4 Extraído con éxito!", extractedMp4);
+          document.getElementById('platform-badge').innerText = 'MP4 Auto-Extraído';
+          renderDirectVideo(extractedMp4, container);
+        } else {
+          console.warn("No se pudo extraer el MP4. Usando visor Iframe estándar.");
+          document.getElementById('platform-badge').innerText = 'Iframe Generico';
+          const iframe = document.createElement('iframe');
+          iframe.className = 'generic-frame';
+          iframe.src = track.url;
+          iframe.allow = "autoplay; encrypted-media";
+          container.appendChild(iframe);
+        }
       }
 
       updatePlaylistUI();
+    }
+
+    function renderDirectVideo(videoUrl, container) {
+      const video = document.createElement('video');
+      video.id = 'plyr-target';
+      video.controls = true;
+      video.autoplay = true;
+      video.src = videoUrl;
+      container.appendChild(video);
+
+      plyrInstance = new Plyr(video, { autoplay: true });
+      plyrInstance.on('ended', () => nextVideo());
+      plyrInstance.once('ready', () => plyrInstance.play());
     }
 
     function nextVideo() {
